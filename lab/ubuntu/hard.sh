@@ -65,6 +65,7 @@ fi
 #############################################
 # Run set-static-ip-interactive.sh
 #############################################
+apt update && apt install -y iproute2
 if [[ -f ./set-static-ip-interactive.sh ]]; then
     echo "🌐 Running set-static-ip-interactive.sh to configure static IP..."
     chmod +x ./set-static-ip-interactive.sh
