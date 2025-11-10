@@ -1,37 +1,91 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Ubuntu Server Hardening Script
+# Target: Ubuntu 22.04 / 24.04 (Jammy / Noble)
+# Author: Murtadah’s paranoid side 😄
+#
+# What it does:
+# - Calls user.sh (create secure admin user)
+# - Calls set-static-ip-interactive.sh (convert current IP to static)
+# - Sets timezone to Asia/Baghdad + enables NTP
+# - SSH hardening (port 2222, no root login, key-only, strong ciphers)
+# - UFW firewall + Fail2Ban
+# - Unattended upgrades
+# - Kernel hardening (sysctl)
+# - Auditd rules (immutable)
+# - Password policy (pwquality + PAM)
+# - Filesystem hardening
+# - AppArmor, AIDE, logrotate
+# - Security monitoring script + cron
+# - Lynis quick audit
+#
+
 set -euo pipefail
 
-# Ubuntu Server Hardening Script
-# Based on CIS Benchmark and DISA STIG
-echo "Creating New User..."
+#############################################
+# Root Check
+#############################################
+if [[ $EUID -ne 0 ]]; then
+    echo "❌ Please run as root: sudo $0"
+    exit 1
+fi
 
+#############################################
+# Logging
+#############################################
+LOGFILE="/var/log/hardening.log"
+mkdir -p "$(dirname "$LOGFILE")"
+touch "$LOGFILE"
+chmod 600 "$LOGFILE"
 
-# Create k8admin user
-adduser --gecos '' --disabled-password k8admin
-echo 'k8admin:M0rB0ss@84' | chpasswd
-usermod -aG sudo k8admin
+exec > >(tee -a "$LOGFILE") 2>&1
 
-# Set up SSH keys for k8admin
-mkdir -p /home/k8admin/.ssh
-chmod 700 /home/k8admin/.ssh
+echo "========================================"
+echo "  🚀 Starting Ubuntu Server Hardening"
+echo "========================================"
 
-# Add your public SSH key here
-cat > /home/k8admin/.ssh/authorized_keys << 'SSHKEY'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUEBpd8uyg2y72qrvyNdWaKFMsyze4PtN4epu/4ad31 murtadah.haddad@gmail.com
-SSHKEY
+#############################################
+# Timezone & NTP
+#############################################
+echo "🕒 Setting timezone to Asia/Baghdad & enabling NTP..."
+timedatectl set-timezone Asia/Baghdad || echo "⚠️ Failed to set timezone."
+timedatectl set-ntp true || echo "⚠️ Failed to enable NTP."
 
-chmod 600 /home/k8admin/.ssh/authorized_keys
-chown -R k8admin:k8admin /home/k8admin/.ssh
+#############################################
+# Run user.sh (create secure admin user)
+#############################################
+if [[ -f ./user.sh ]]; then
+    echo "👤 Running user.sh to create secure user..."
+    chmod +x ./user.sh
+    ./user.sh
+else
+    echo "⚠️ user.sh not found. Skipping user creation."
+fi
 
+#############################################
+# Run set-static-ip-interactive.sh
+#############################################
+if [[ -f ./set-static-ip-interactive.sh ]]; then
+    echo "🌐 Running set-static-ip-interactive.sh to configure static IP..."
+    chmod +x ./set-static-ip-interactive.sh
+    ./set-static-ip-interactive.sh
+else
+    echo "⚠️ set-static-ip-interactive.sh not found. Skipping static IP config."
+fi
 
+#############################################
+# System Update
+#############################################
+echo "📦 Updating system packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get upgrade -y
 
-echo "Starting Ubuntu Server Hardening..."
-
-# Update system
-apt-get update && apt-get upgrade -y
-
-# Install security packages
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
+#############################################
+# Install Security & Utility Packages
+#############################################
+echo "📦 Installing security tooling..."
+apt-get install -y \
     openssh-server \
     ufw \
     fail2ban \
@@ -45,17 +99,22 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     lynis \
     libpam-pwquality \
     libpam-tmpdir \
-    mailutils
+    mailutils \
+    cron \
+    rsyslog
 
-# Start SSH service to generate default config
-systemctl start ssh
-
+systemctl enable ssh --now
 
 #############################################
 # SSH Hardening
 #############################################
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-cat > /etc/ssh/sshd_config << 'EOF'
+echo "🔐 Hardening SSH..."
+
+SSHD_CFG="/etc/ssh/sshd_config"
+SSHD_BAK="/etc/ssh/sshd_config.bak.$(date +%s)"
+cp "$SSHD_CFG" "$SSHD_BAK"
+
+cat > "$SSHD_CFG" << 'EOF'
 Port 2222
 Protocol 2
 PermitRootLogin no
@@ -82,18 +141,29 @@ SyslogFacility AUTH
 AllowUsers k8admin
 EOF
 
+# Test SSH config before restart
+if sshd -t 2>/dev/null; then
+    systemctl restart ssh || systemctl restart sshd
+else
+    echo "❌ sshd_config invalid. Restoring backup."
+    cp "$SSHD_BAK" "$SSHD_CFG"
+    systemctl restart ssh || systemctl restart sshd
+fi
+
 #############################################
-# Firewall Configuration (UFW)
+# UFW Firewall
 #############################################
+echo "🛡️ Configuring UFW..."
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging on
-ufw allow 2222/tcp comment 'SSH'
-echo "y" | ufw enable
+ufw allow 2222/tcp comment 'SSH Hardened'
+ufw --force enable
 
 #############################################
-# Fail2Ban Configuration
+# Fail2Ban
 #############################################
+echo "🧱 Configuring Fail2Ban..."
 cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
 bantime = 1h
@@ -122,20 +192,29 @@ bantime = 86400
 EOF
 
 systemctl enable fail2ban
-systemctl restart fail2ban
+systemctl restart fail2ban || echo "⚠️ Fail2Ban restart failed."
 
 #############################################
-# Automatic Updates
+# Unattended Upgrades
 #############################################
-cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+echo "🔄 Configuring unattended upgrades..."
+
+if command -v lsb_release >/dev/null 2>&1; then
+    DISTRO_ID=$(lsb_release -is)
+    DISTRO_CODENAME=$(lsb_release -cs)
+else
+    # Fallback
+    . /etc/os-release
+    DISTRO_ID=$ID
+    DISTRO_CODENAME=$VERSION_CODENAME
+fi
+
+cat > /etc/apt/apt.conf.d/50unattended-upgrades <<EOF
 Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}";
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}:${distro_codename}-updates";
+    "${DISTRO_ID}:${DISTRO_CODENAME}";
+    "${DISTRO_ID}:${DISTRO_CODENAME}-security";
+    "${DISTRO_ID}:${DISTRO_CODENAME}-updates";
 };
-Unattended-Upgrade::Package-Blacklist {
-};
-Unattended-Upgrade::DevRelease "false";
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::InstallOnShutdown "false";
@@ -155,10 +234,11 @@ APT::Periodic::AutocleanInterval "7";
 EOF
 
 #############################################
-# Kernel Hardening (sysctl)
+# Kernel / sysctl Hardening
 #############################################
+echo "⚙️ Applying kernel hardening (sysctl)..."
+
 cat > /etc/sysctl.d/99-security.conf << 'EOF'
-# Kernel hardening
 kernel.randomize_va_space = 2
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
@@ -171,7 +251,6 @@ kernel.sysrq = 0
 kernel.unprivileged_userns_clone = 0
 kernel.perf_event_paranoid = 3
 
-# Network security
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
@@ -195,41 +274,35 @@ net.ipv6.conf.default.accept_source_route = 0
 net.ipv6.conf.all.forwarding = 0
 net.ipv4.ip_forward = 0
 
-# Increase system file descriptor limit
 fs.file-max = 65535
-
-# Discourage Linux from swapping idle processes to disk
 vm.swappiness = 1
 EOF
 
-sysctl -p /etc/sysctl.d/99-security.conf
+sysctl --system
 
 #############################################
-# Audit Configuration (auditd)
+# Auditd Configuration
 #############################################
-cat > /etc/audit/rules.d/audit.rules << 'EOF'
-# Remove all existing rules
+echo "📋 Configuring auditd..."
+
+cat > /etc/audit/rules.d/hardening.rules << 'EOF'
 -D
-
-# Buffer Size
 -b 8192
-
-# Failure Mode (2 = panic)
 -f 1
 
-# Audit time changes
+# Time changes
 -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change
 -a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k time-change
 -w /etc/localtime -p wa -k time-change
 
-# Audit user/group changes
+# Identity files
 -w /etc/group -p wa -k identity
 -w /etc/passwd -p wa -k identity
 -w /etc/gshadow -p wa -k identity
 -w /etc/shadow -p wa -k identity
 -w /etc/security/opasswd -p wa -k identity
 
-# Audit network changes
+# Network
 -a always,exit -F arch=b64 -S sethostname,setdomainname -k network
 -a always,exit -F arch=b32 -S sethostname,setdomainname -k network
 -w /etc/issue -p wa -k network
@@ -237,50 +310,49 @@ cat > /etc/audit/rules.d/audit.rules << 'EOF'
 -w /etc/hosts -p wa -k network
 -w /etc/network -p wa -k network
 
-# Audit system calls
+# Mounts
 -a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
 -a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
 
-# Audit file deletions
+# File deletions
 -a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=4294967295 -k delete
 -a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=4294967295 -k delete
 
-# Audit sudoers
+# Sudoers
 -w /etc/sudoers -p wa -k sudoers
 -w /etc/sudoers.d/ -p wa -k sudoers
 
-# Audit kernel modules
+# Modules
 -w /sbin/insmod -p x -k modules
 -w /sbin/rmmod -p x -k modules
 -w /sbin/modprobe -p x -k modules
 -a always,exit -F arch=b64 -S init_module,delete_module -k modules
 
-# Audit login/logout
+# Logins
 -w /var/log/faillog -p wa -k logins
 -w /var/log/lastlog -p wa -k logins
 -w /var/log/tallylog -p wa -k logins
-
-# Audit session initiation
 -w /var/run/utmp -p wa -k session
 -w /var/log/wtmp -p wa -k logins
 -w /var/log/btmp -p wa -k logins
 
-# Audit permission changes
+# Perm / ownership changes
 -a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
 -a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
 -a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
 -a always,exit -F arch=b32 -S chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
 
-# Make audit configuration immutable
 -e 2
 EOF
 
 systemctl enable auditd
-systemctl restart auditd
+systemctl restart auditd || echo "⚠️ auditd restart failed."
 
 #############################################
-# Password Policy
+# Password Policy (pwquality + PAM)
 #############################################
+echo "🔑 Configuring password policy..."
+
 cat > /etc/security/pwquality.conf << 'EOF'
 minlen = 14
 dcredit = -1
@@ -296,18 +368,21 @@ usercheck = 1
 enforcing = 1
 EOF
 
-# Configure PAM
-sed -i 's/^password.*pam_unix.so.*/password required pam_unix.so obscure sha512 remember=5 rounds=65536/' /etc/pam.d/common-password
+# Harden PAM common-password (Debian/Ubuntu)
+if grep -q "pam_unix.so" /etc/pam.d/common-password; then
+    sed -i 's#^password\s\+.*pam_unix.so.*#password required pam_unix.so obscure sha512 remember=5 rounds=65536#' /etc/pam.d/common-password
+fi
 
 #############################################
-# File System Hardening
+# Filesystem Hardening
 #############################################
-# Set secure permissions
+echo "📂 Hardening filesystem permissions..."
+
 chmod 644 /etc/passwd
 chmod 600 /etc/shadow
 chmod 644 /etc/group
 chmod 600 /etc/gshadow
-chmod 600 /boot/grub/grub.cfg
+chmod 600 /boot/grub/grub.cfg 2>/dev/null || true
 
 # Disable core dumps
 cat > /etc/security/limits.d/10-no-core.conf << 'EOF'
@@ -318,36 +393,39 @@ cat > /etc/sysctl.d/10-no-core.conf << 'EOF'
 fs.suid_dumpable = 0
 EOF
 
+sysctl --system
+
 #############################################
 # AppArmor
 #############################################
-systemctl enable apparmor
-aa-enforce /etc/apparmor.d/*
+echo "🛡️ Enforcing AppArmor..."
+systemctl enable apparmor || true
+systemctl start apparmor || true
+aa-enforce /etc/apparmor.d/* || true
 
 #############################################
-# AIDE (Intrusion Detection)
+# AIDE (File Integrity)
 #############################################
-aideinit
-mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+echo "🔍 Initializing AIDE..."
+aideinit || true
+if [[ -f /var/lib/aide/aide.db.new ]]; then
+    mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+fi
 
-# Schedule daily AIDE checks
 cat > /etc/cron.daily/aide << 'EOF'
 #!/bin/bash
-/usr/bin/aide --check | mail -s "AIDE Report $(hostname)" murtadah.haddad@gmail.com
+/usr/bin/aide --check | mail -s "AIDE Report $(hostname)" murtadah.haddad@gmail.com || true
 EOF
 chmod +x /etc/cron.daily/aide
 
 #############################################
 # Disable Unnecessary Services
 #############################################
-systemctl disable avahi-daemon 2>/dev/null || true
-systemctl disable cups 2>/dev/null || true
-systemctl disable isc-dhcp-server 2>/dev/null || true
-systemctl disable isc-dhcp-server6 2>/dev/null || true
-systemctl disable nfs-server 2>/dev/null || true
-systemctl disable rpcbind 2>/dev/null || true
-systemctl disable rsync 2>/dev/null || true
-systemctl disable snmpd 2>/dev/null || true
+echo "🚫 Disabling unnecessary services..."
+for svc in avahi-daemon cups isc-dhcp-server isc-dhcp-server6 nfs-server rpcbind rsync snmpd; do
+    systemctl disable "$svc" 2>/dev/null || true
+    systemctl stop "$svc" 2>/dev/null || true
+done
 
 #############################################
 # Security Limits
@@ -360,7 +438,7 @@ cat > /etc/security/limits.d/99-security.conf << 'EOF'
 EOF
 
 #############################################
-# Logrotate Configuration
+# Logrotate for Security Logs
 #############################################
 cat > /etc/logrotate.d/security << 'EOF'
 /var/log/auth.log
@@ -373,53 +451,64 @@ cat > /etc/logrotate.d/security << 'EOF'
     missingok
     notifempty
     create 0640 root adm
+    sharedscripts
 }
 EOF
 
 #############################################
-# Create Security Monitoring Script
+# Security Monitoring Script
 #############################################
+echo "📝 Creating security-check.sh..."
+
 cat > /usr/local/bin/security-check.sh << 'EOF'
 #!/bin/bash
-
 REPORT="/tmp/security-report.txt"
-echo "Security Report - $(date)" > $REPORT
-echo "=============================" >> $REPORT
+{
+echo "Security Report - $(date)"
+echo "============================="
 
-echo -e "\n=== Failed Login Attempts ===" >> $REPORT
-grep "Failed password" /var/log/auth.log | tail -20 >> $REPORT
+echo -e "\n=== Failed Login Attempts ==="
+grep "Failed password" /var/log/auth.log | tail -20 || true
 
-echo -e "\n=== Firewall Status ===" >> $REPORT
-ufw status >> $REPORT
+echo -e "\n=== Firewall Status ==="
+ufw status verbose || true
 
-echo -e "\n=== Listening Services ===" >> $REPORT
-ss -tulpn >> $REPORT
+echo -e "\n=== Listening Services ==="
+ss -tulpn || true
 
-echo -e "\n=== Recent sudo commands ===" >> $REPORT
-grep sudo /var/log/auth.log | tail -20 >> $REPORT
+echo -e "\n=== Recent sudo commands ==="
+grep "sudo" /var/log/auth.log | tail -20 || true
 
-echo -e "\n=== Disk Usage ===" >> $REPORT
-df -h >> $REPORT
+echo -e "\n=== Disk Usage ==="
+df -h
 
-echo -e "\n=== Failed2ban Status ===" >> $REPORT
-fail2ban-client status >> $REPORT
+echo -e "\n=== Fail2Ban Status ==="
+fail2ban-client status || true
+} > "$REPORT"
 
-cat $REPORT | mail -s "Security Report $(hostname)" murtadah.haddad@gmail.com
+mail -s "Security Report $(hostname)" murtadah.haddad@gmail.com < "$REPORT" || true
 EOF
 
 chmod +x /usr/local/bin/security-check.sh
 
-# Schedule weekly security checks
-echo "0 2 * * 0 root /usr/local/bin/security-check.sh" > /etc/cron.d/security-check
+cat > /etc/cron.d/security-check << 'EOF'
+0 2 * * 0 root /usr/local/bin/security-check.sh
+EOF
 
 #############################################
-# Final Steps
+# Lynis Quick Audit
 #############################################
-echo "Running security scan with Lynis..."
-lynis audit system --quick
+echo "🔎 Running Lynis quick audit (non-fatal)..."
+lynis audit system --quick || true
 
-echo "=============================="
-echo "Hardening Complete!"
-echo "=============================="
-echo "IMPORTANT: Reboot the system to apply all changes"
-echo "Run 'lynis audit system' for detailed security audit"
+#############################################
+# Final Message
+#############################################
+echo "========================================"
+echo "✅ Hardening Complete!"
+echo "SSH now on port 2222 with key-only login."
+echo "Timezone: Asia/Baghdad"
+echo "Logs: $LOGFILE"
+echo "⚠️ IMPORTANT: Test SSH on port 2222 BEFORE closing your current session."
+echo "⚠️ Recommended: Reboot the system to apply all changes."
+echo "========================================"
